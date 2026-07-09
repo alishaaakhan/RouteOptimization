@@ -1,97 +1,136 @@
 from flask import Flask, render_template, request, jsonify
+from dotenv import load_dotenv
+import os
 import googlemaps
-from datetime import datetime
-from itertools import permutations
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+load_dotenv()
 
 app = Flask(__name__)
-API_KEY = "API_KEY"
-map_client = googlemaps.Client(key=API_KEY)
-get_duration_cache = {}
 
-def get_duration(origin, destination):
-    print(f"Getting duration from {origin} → {destination}")
+API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+gmaps = googlemaps.Client(key=API_KEY)
 
-    key = (origin, destination)
-    #Check dictionary for duplicates to save runtime and reduce API calls
-    if key in get_duration_cache:
-        return get_duration_cache[key]
 
-    directions_result = map_client.directions( #creates JSON object
-        origin,
-        destination,
+def get_distance_matrix(locations):
+    matrix = gmaps.distance_matrix(
+        locations,
+        locations,
         mode="driving",
-        departure_time=datetime.now(), #Tells google to consider current traffic conditions
+        units="metric"
     )
 
-    if directions_result:
-        leg = directions_result[0]["legs"][0]
-        duration = leg["duration"]["value"] / 3600 # convert seconds → hours
-        return float(duration)
-    return None
+    distances = []
 
-def calculate_shortest_travel(origin, destinations):
-    most_efficient_option = None
-    shortest_time = float("inf")
-    all_routes = []
+    for row in matrix["rows"]:
+        distances.append([
+            element["distance"]["value"]
+            for element in row["elements"]
+        ])
 
-    for order in permutations(destinations):
-        route = [origin] + list(order)
-        total = 0
+    return distances
 
-        for i in range(len(route) - 1):
-            key = (route[i], route[i + 1])
-            if key in get_duration_cache:
-                duration = get_duration_cache[key]
-            else:
-                duration = get_duration(route[i], route[i + 1])
-                get_duration_cache[key] = duration
-                reverse_key = (route[i + 1], route[i])
-                if reverse_key not in get_duration_cache:
-                    get_duration_cache[reverse_key] = duration
-            total += duration
 
-        all_routes.append((route, total))
+def optimize_route(distance_matrix):
+    manager = pywrapcp.RoutingIndexManager(
+        len(distance_matrix),
+        1,
+        0
+    )
 
-        if total < shortest_time:
-            shortest_time = total
-            most_efficient_option = route
+    routing = pywrapcp.RoutingModel(manager)
 
-    return most_efficient_option, shortest_time, all_routes
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return distance_matrix[from_node][to_node]
+
+    transit_callback = routing.RegisterTransitCallback(distance_callback)
+
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+
+    solution = routing.SolveWithParameters(search_parameters)
+
+    if not solution:
+        return []
+
+    index = routing.Start(0)
+
+    order = []
+
+    while not routing.IsEnd(index):
+        order.append(manager.IndexToNode(index))
+        index = solution.Value(routing.NextVar(index))
+
+    return order
 
 
 @app.route("/")
-def index():
+def home():
     return render_template("index.html")
 
-@app.route("/calculate", methods=["POST"])
-@app.route("/calculate", methods=["POST"])
-def calculate():
-    data = request.get_json()
-    origin = data.get("origin")
-    destinations = data.get("destinations", [])
 
-    best_route, best_time, all_routes = calculate_shortest_travel(origin, destinations)
-    return jsonify({
-        "best_route": best_route,
-        "best_time": round(best_time, 2),
-        "all_routes": [{ "route": r, "time": round(t, 2) } for r, t in all_routes]
-    })
+@app.route("/optimize", methods=["POST"])
+def optimize():
+
+    data = request.get_json()
+
+    locations = data.get("locations", [])
+
+    if len(locations) < 2:
+        return jsonify({
+            "success": False,
+            "message": "Please enter at least two locations."
+        })
+
+    try:
+
+        distance_matrix = get_distance_matrix(locations)
+
+        route = optimize_route(distance_matrix)
+
+        optimized = [locations[i] for i in route]
+
+        directions = gmaps.directions(
+            optimized[0],
+            optimized[-1],
+            waypoints=optimized[1:-1],
+            optimize_waypoints=False,
+            mode="driving"
+        )
+
+        total_distance = 0
+        total_duration = 0
+
+        if directions:
+
+            legs = directions[0]["legs"]
+
+            for leg in legs:
+                total_distance += leg["distance"]["value"]
+                total_duration += leg["duration"]["value"]
+
+        return jsonify({
+            "success": True,
+            "optimized_route": optimized,
+            "distance_km": round(total_distance / 1000, 2),
+            "duration_min": round(total_duration / 60),
+            "google_maps_link": f"https://www.google.com/maps/dir/{'/'.join(optimized)}"
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        })
+
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
-"""
-""Ex: To Call the program:
-origin = "Texas Tech University, Lubbock, TX"
-destinations = [
-    "Dallas, TX",
-    "Austin, TX, 6th Street",
-    "Houston, TX",
-    "Waco, TX"]
-
-
-calculate_shortest_travel(origin, destinations)
-
-
-"""
